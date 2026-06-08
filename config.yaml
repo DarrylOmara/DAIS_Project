@@ -1,0 +1,17 @@
+tickers:
+  - JEPI
+  - DGRO
+  - SCHD
+  - VYM
+  - KBWY
+benchmark: SPY
+period_years: 2
+initial_capital: 300
+core_buy_amt: 100
+base_buy: 5
+base_sell: 10
+inventory_floor: 60
+beta_default: 1.0
+output_dir: outputs/DAIS_Deliverables
+data_dir: data
+log_level: INFO
