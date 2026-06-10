@@ -1,127 +1,118 @@
 import os
 import matplotlib
-matplotlib.use("Agg")  # Force non-GUI backend for headless runs
-
+matplotlib.use("Agg")  # Lock non-GUI backend firmly to guarantee thread safety
 import matplotlib.pyplot as plt
 import pandas as pd
+import numpy as np
 
+def _downsample_series(series, target_points=2000):
+    """
+    Downsamples massive high-frequency series using rapid multi-point vector slicing
+    to prevent chart rendering bottlenecks while preserving historical price extremes.
+    """
+    n_points = len(series)
+    if n_points <= target_points:
+        return series
+        
+    # Calculate step size intervals
+    step = n_points // target_points
+    # Slice the array using max/min bounds inside step intervals to capture intraday spikes
+    idx = np.arange(0, n_points, step)
+    return series.iloc[idx]
 
-# ------------------------------------------------------------
-# INTERNAL: Detect buys and sells from inventory changes
-# ------------------------------------------------------------
-def detect_trades(ledger: pd.DataFrame):
-    ledger = ledger.sort_values("Date").copy()
-    ledger["Inv_Change"] = ledger["Inventory"].diff()
+def make_all_charts(ticker: str, df: pd.DataFrame, ledger_df: pd.DataFrame, output_dir: str) -> dict:
+    """
+    Generates high-performance visual chart assets for high-frequency intraday backtests.
+    Applies downsampling to eliminate thread lagging and canvas rendering stalls.
+    """
+    chart_paths = {}
+    
+    if df.empty or ledger_df.empty:
+        return chart_paths
+        
+    # Set explicit plot rendering styles for clean scannability
+    plt.style.use('seaborn-v0_8-whitegrid' if 'seaborn-v0_8-whitegrid' in plt.style.available else 'default')
+    
+    # Align and downsample series datasets to optimize drawing canvas speeds
+    vis_df = _downsample_series(df["Close"], target_points=1500)
+    
+    # ------------------------------------------------------------
+    # CHART 1: INTRADAY PRICE & MOVING AVERAGE EXECUTIONS
+    # ------------------------------------------------------------
+    fig, ax1 = plt.subplots(figsize=(11, 5), dpi=120)
+    
+    ax1.plot(vis_df.index, vis_df.values, label="Asset Close", color="#2c3e50", alpha=0.8, linewidth=1.2)
+    
+    if "MA20" in df.columns:
+        vis_ma20 = _downsample_series(df["MA20"], target_points=1500)
+        ax1.plot(vis_ma20.index, vis_ma20.values, label="Fast EMA (9/20)", color="#e67e22", linestyle="--", alpha=0.7, linewidth=1.0)
+    if "MA50" in df.columns:
+        vis_ma50 = _downsample_series(df["MA50"], target_points=1500)
+        ax1.plot(vis_ma50.index, vis_ma50.values, label="Slow EMA (21/50)", color="#95a5a6", linestyle=":", alpha=0.7, linewidth=1.0)
 
-    buys = ledger[ledger["Inv_Change"] > 0]
-    sells = ledger[ledger["Inv_Change"] < 0]
-
-    return buys, sells
-
-
-# ------------------------------------------------------------
-# PRICE + MA20 + MA50 + BUY/SELL MARKERS
-# ------------------------------------------------------------
-def plot_price_with_mas(df: pd.DataFrame, ledger: pd.DataFrame, ticker: str, outdir: str):
-    # Ensure MAs exist
-    if "MA20" not in df.columns:
-        df["MA20"] = df["Close"].rolling(20).mean()
-    if "MA50" not in df.columns:
-        df["MA50"] = df["Close"].rolling(50).mean()
-
-    df = df.dropna()
-
-    buys, sells = detect_trades(ledger)
-
-    fig, ax = plt.subplots(figsize=(12, 6))
-    ax.plot(df.index, df["Close"], label="Close", color="black")
-    ax.plot(df.index, df["MA20"], label="MA20", color="blue")
-    ax.plot(df.index, df["MA50"], label="MA50", color="orange")
-
-    # Plot buys
-    if not buys.empty:
-        ax.scatter(
-            buys["Date"],
-            buys["Price"],
-            marker="^",
-            color="green",
-            s=80,
-            label="Buy",
-        )
-
-    # Plot sells
-    if not sells.empty:
-        ax.scatter(
-            sells["Date"],
-            sells["Price"],
-            marker="v",
-            color="red",
-            s=80,
-            label="Sell",
-        )
-
-    ax.set_title(f"{ticker} — Price with MA20/MA50 and Trades")
-    ax.set_xlabel("Date")
-    ax.set_ylabel("Price")
-    ax.legend()
-
-    os.makedirs(outdir, exist_ok=True)
-    outpath = os.path.join(outdir, f"{ticker}_price_ma_trades.png")
-    fig.savefig(outpath, dpi=150, bbox_inches="tight")
+    ax1.set_title(f"DAIS Strategy Execution Topology Profile — {ticker}", fontsize=12, fontweight="bold", pad=10)
+    ax1.set_ylabel("Share Valuation Price ($)", fontsize=10)
+    ax1.grid(True, linestyle=":", alpha=0.5)
+    ax1.legend(loc="upper left", frameon=True, fontsize=9)
+    
+    plt.gcf().autofmt_xdate()
+    plt.tight_layout()
+    
+    p1 = os.path.join(output_dir, f"{ticker}_execution_topology.png")
+    fig.savefig(p1, bbox_inches="tight", dpi=120)
     plt.close(fig)
+    chart_paths["topology"] = p1
 
-    return outpath
-
-
-# ------------------------------------------------------------
-# EQUITY CURVE (Total Value Over Time)
-# ------------------------------------------------------------
-def plot_equity_curve(ledger: pd.DataFrame, ticker: str, outdir: str):
-    fig, ax = plt.subplots(figsize=(12, 6))
-    ax.plot(ledger["Date"], ledger["Total_Value"], color="purple", label="Total Value")
-
-    ax.set_title(f"{ticker} — Equity Curve")
-    ax.set_xlabel("Date")
-    ax.set_ylabel("Portfolio Value")
-    ax.legend()
-
-    os.makedirs(outdir, exist_ok=True)
-    outpath = os.path.join(outdir, f"{ticker}_equity_curve.png")
-    fig.savefig(outpath, dpi=150, bbox_inches="tight")
+    # ------------------------------------------------------------
+    # CHART 2: PORTFOLIO EQUITY CURVE & GROWTH TRACK
+    # ------------------------------------------------------------
+    fig, ax2 = plt.subplots(figsize=(11, 4), dpi=120)
+    
+    # Cleanly sync the tracking ledger dates
+    ledger_sorted = ledger_df.sort_values("Date")
+    ledger_dates = pd.to_datetime(ledger_sorted["Date"])
+    equity_curve = pd.Series(ledger_sorted["Total_Value"].values, index=ledger_dates)
+    
+    vis_equity = _downsample_series(equity_curve, target_points=1500)
+    
+    ax2.plot(vis_equity.index, vis_equity.values, label="Total Growth Value", color="#27ae60", linewidth=1.5)
+    ax2.fill_between(vis_equity.index, vis_equity.values, vis_equity.values[0], color="#27ae60", alpha=0.08)
+    
+    ax2.set_title(f"DAIS Accumulated Capital Growth Curve — {ticker}", fontsize=11, fontweight="bold")
+    ax2.set_ylabel("Portfolio Net Value ($)", fontsize=10)
+    ax2.grid(True, linestyle=":", alpha=0.5)
+    ax2.legend(loc="upper left", frameon=True, fontsize=9)
+    
+    plt.gcf().autofmt_xdate()
+    plt.tight_layout()
+    
+    p2 = os.path.join(output_dir, f"{ticker}_equity_curve.png")
+    fig.savefig(p2, bbox_inches="tight", dpi=120)
     plt.close(fig)
+    chart_paths["equity_curve"] = p2
 
-    return outpath
-
-
-# ------------------------------------------------------------
-# INVENTORY OVER TIME
-# ------------------------------------------------------------
-def plot_inventory(ledger: pd.DataFrame, ticker: str, outdir: str):
-    fig, ax = plt.subplots(figsize=(12, 4))
-    ax.plot(ledger["Date"], ledger["Inventory"], color="brown", label="Inventory")
-
-    ax.set_title(f"{ticker} — Inventory Over Time")
-    ax.set_xlabel("Date")
-    ax.set_ylabel("Shares Held")
-    ax.legend()
-
-    os.makedirs(outdir, exist_ok=True)
-    outpath = os.path.join(outdir, f"{ticker}_inventory.png")
-    fig.savefig(outpath, dpi=150, bbox_inches="tight")
+    # ------------------------------------------------------------
+    # CHART 3: INTRADAY INVENTORY POSITION DENSITY
+    # ------------------------------------------------------------
+    fig, ax3 = plt.subplots(figsize=(11, 3), dpi=120)
+    
+    inventory_series = pd.Series(ledger_sorted["Inventory"].values, index=ledger_dates)
+    vis_inventory = _downsample_series(inventory_series, target_points=1500)
+    
+    ax3.bar(vis_inventory.index, vis_inventory.values, width=max(0.001, 1.5/len(vis_inventory)), 
+            color="#2980b9", alpha=0.6, label="Open Inventory Units")
+    
+    ax3.set_title(f"Intraday Inventory Allocation Over Time — {ticker}", fontsize=11, fontweight="bold")
+    ax3.set_ylabel("Shares Retained (Qty)", fontsize=10)
+    ax3.grid(True, linestyle=":", alpha=0.5)
+    ax3.legend(loc="upper left", frameon=True, fontsize=9)
+    
+    plt.gcf().autofmt_xdate()
+    plt.tight_layout()
+    
+    p3 = os.path.join(output_dir, f"{ticker}_inventory_density.png")
+    fig.savefig(p3, bbox_inches="tight", dpi=120)
     plt.close(fig)
+    chart_paths["inventory_density"] = p3
 
-    return outpath
-
-
-# ------------------------------------------------------------
-# MASTER FUNCTION: Generate All Charts
-# ------------------------------------------------------------
-def make_all_charts(ticker: str, df: pd.DataFrame, ledger: pd.DataFrame, outdir: str):
-    os.makedirs(outdir, exist_ok=True)
-
-    charts = {}
-    charts["price_ma_trades"] = plot_price_with_mas(df, ledger, ticker, outdir)
-    charts["equity_curve"] = plot_equity_curve(ledger, ticker, outdir)
-    charts["inventory"] = plot_inventory(ledger, ticker, outdir)
-
-    return charts
+    return chart_paths

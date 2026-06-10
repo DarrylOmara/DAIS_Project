@@ -1,5 +1,5 @@
 import matplotlib
-matplotlib.use("Agg")  # Force non-GUI backend globally before any pyplot import
+matplotlib.use("Agg")  # Force non-GUI backend globally to maximize thread speed
 
 import os
 import time
@@ -18,77 +18,80 @@ from src.pptx_builder import build_presentation
 from src.dashboard_export import build_dashboard_html
 from src.docx_guide import build_docx_guide
 
-
 # ------------------------------------------------------------
-# LOGGING SETUP
+# HIGH-PERFORMANCE LOGGING INITIALIZATION
 # ------------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
+    format="%(asctime)s [%(levelname)s] (%(threadName)s) %(message)s",
 )
-logger = logging.getLogger("DAIS")
+logger = logging.getLogger("DAIS_Intraday")
 
-
-# ------------------------------------------------------------
-# LOAD CONFIG
-# ------------------------------------------------------------
 def load_config(config_path: str = "config.yaml"):
     with open(config_path, "r") as f:
-        cfg = yaml.safe_load(f)
-    return cfg
-
+        return yaml.safe_load(f)
 
 # ------------------------------------------------------------
-# SINGLE-TICKER PIPELINE (exception-safe)
+# HIGH-SPEED TICKER PIPELINE WORKER
 # ------------------------------------------------------------
 def run_for_ticker(ticker: str, cfg: dict, benchmark_close: pd.Series, outdir: str):
     start = time.time()
-    logger.info(f"Starting pipeline for {ticker}")
-
+    logger.info(f"Processing high-frequency matrix for {ticker}")
     try:
         data_dir = cfg.get("data_dir", "data")
         df_path = os.path.join(data_dir, f"{ticker}.csv")
+        
+        if not os.path.exists(df_path):
+            raise FileNotFoundError(f"Missing intraday data asset: {df_path}")
+            
+        # High-speed data loading with explicit timestamp parsing
         df = pd.read_csv(df_path, parse_dates=["Date"]).set_index("Date").sort_index()
-
-        # Compute moving averages if not present
+        
+        # 1. Compute technical indicators (EMA/MA)
         df = compute_mas(df)
-
-        # True beta
-        beta_true = compute_true_beta(df["Close"], benchmark_close)
-        if pd.isna(beta_true):
-            beta_use = cfg["beta_default"]
+        
+        # 2. Strict index alignment to calculate the true beta metric
+        # Use an inner join to ensure timestamps match the benchmark exactly
+        aligned = df.join(benchmark_close.rename("Bench_Close"), how="inner")
+        if not aligned.empty:
+            beta_true = compute_true_beta(aligned["Close"], aligned["Bench_Close"])
         else:
-            beta_use = beta_true
+            beta_true = float("nan")
+            
+        beta_use = cfg.get("beta_default", 1.0) if pd.isna(beta_true) else beta_true
 
-        # Engine
+        # 3. Initialize High-Frequency Execution Engine
         engine = DAISTradingEngine(
             beta=beta_use,
             initial_capital=cfg["initial_capital"],
             core_buy_amt=cfg["core_buy_amt"],
-            base_buy=cfg["base_buy"],
-            base_sell=cfg["base_sell"],
-            inventory_floor=cfg["inventory_floor"],
+            base_buy=cfg["base_buy_shares"],       # Swapped to share units
+            base_sell=cfg["base_sell_shares"],     # Swapped to share units
+            inventory_floor=cfg["inventory_floor_shares"], # Swapped to share units
         )
-
-        ledger = engine.run_backtest(df)
-
+        
+        # Execute the optimized backtest loop
+        ledger = engine.run_backtest(df, cfg)
+        
+        # Local output path structures
         ticker_outdir = os.path.join(outdir, ticker)
         os.makedirs(ticker_outdir, exist_ok=True)
-
-        # Save ledger
+        
+        # Export performance telemetry
         ledger_csv = os.path.join(ticker_outdir, f"{ticker}_ledger.csv")
         ledger.to_csv(ledger_csv, index=False)
-
-        # Metrics
+        
         metrics = performance_metrics_from_ledger(ledger, df["Close"])
         metrics_csv = os.path.join(ticker_outdir, f"{ticker}_metrics.csv")
         pd.DataFrame([metrics]).to_csv(metrics_csv, index=False)
-
-        # Charts
+        
+        # Generate diagnostic charts
         charts = make_all_charts(ticker, df, ledger, ticker_outdir)
-
-        # Collect engine stats for reporting
-        result = {
+        
+        elapsed = time.time() - start
+        logger.info(f"Completed {ticker} intraday backtest [{len(df)} rows] in {elapsed:.2f}s")
+        
+        return {
             "ticker": ticker,
             "metrics": metrics,
             "beta_true": beta_true,
@@ -97,93 +100,62 @@ def run_for_ticker(ticker: str, cfg: dict, benchmark_close: pd.Series, outdir: s
             "ledger_csv": ledger_csv,
             "charts": charts,
         }
-
-        elapsed = time.time() - start
-        logger.info(f"Completed pipeline for {ticker} in {elapsed:.2f}s")
-
-        return result
-
+        
     except Exception as e:
-        logger.error(f"Error processing {ticker}: {e}", exc_info=True)
+        logger.error(f"Execution fault inside ticker thread {ticker}: {e}", exc_info=True)
         return {
-            "ticker": ticker,
-            "metrics": {},
-            "beta_true": float("nan"),
-            "sell_rule_stats": {},
-            "trade_stats": {},
-            "ledger_csv": "",
-            "charts": {},
-            "error": str(e),
+            "ticker": ticker, "metrics": {}, "beta_true": float("nan"),
+            "sell_rule_stats": {}, "trade_stats": {}, "ledger_csv": "",
+            "charts": {}, "error": str(e),
         }
 
-
 # ------------------------------------------------------------
-# MAIN
+# PIPELINE ORCHESTRATOR
 # ------------------------------------------------------------
 def main():
     cfg = load_config()
-    outdir = cfg.get("outdir", "output")
+    
+    # Extract destination paths, defaulting to standard outputs if empty
+    outdir = cfg.get("output_dir", "outputs/DAIS_Deliverables")
     os.makedirs(outdir, exist_ok=True)
-
+    
     tickers = cfg.get("tickers", [])
-    benchmark = cfg.get("benchmark", "SPY")
-
-    logger.info(f"Fetching benchmark data: {benchmark}")
+    benchmark = cfg.get("benchmark", "NASDQ")
+    
+    logger.info(f"Loading intraday benchmark reference series: {benchmark}")
     benchmark_df = fetch_daily(
-        benchmark,
-        cfg["period_years"],
-        data_dir=cfg.get("data_dir", "data")
+        benchmark, cfg.get("lookback_days", 30), data_dir=cfg.get("data_dir", "data")
     )
-
-    # PATCH APPLIED HERE
-    benchmark_df = benchmark_df.sort_index()
-
-    benchmark_close = benchmark_df["Close"]
-
+    benchmark_close = benchmark_df.sort_index()["Close"]
+    
     summary = []
-
-    # Parallel processing with progress bar
-    logger.info("Starting parallel ticker processing...")
-    with ThreadPoolExecutor(max_workers=cfg.get("max_workers", 4)) as executor:
+    max_workers = min(int(cfg.get("max_workers", 4)), len(tickers))
+    
+    logger.info(f"Spawning thread workers (Count: {max_workers}) across data frames...")
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {
-            executor.submit(run_for_ticker, ticker, cfg, benchmark_close, outdir): ticker
+            executor.submit(run_for_ticker, ticker, cfg, benchmark_close, outdir): ticker 
             for ticker in tickers
         }
-
-        for future in tqdm(as_completed(futures), total=len(futures), desc="Tickers"):
-            ticker = futures[future]
-            result = future.result()
-            summary.append(result)
-
-    logger.info("All tickers processed. Building reports...")
-
-    # Reporting modules (exception-safe)
-    try:
-        pdf_path = build_pdf_report(summary, cfg, outdir)
-        logger.info(f"PDF report built: {pdf_path}")
-    except Exception as e:
-        logger.error(f"Error building PDF report: {e}", exc_info=True)
-
-    try:
-        pptx_path = build_presentation(summary, cfg, outdir)
-        logger.info(f"PPTX deck built: {pptx_path}")
-    except Exception as e:
-        logger.error(f"Error building PPTX deck: {e}", exc_info=True)
-
-    try:
-        dashboard_path = build_dashboard_html(summary, cfg, outdir)
-        logger.info(f"Dashboard HTML built: {dashboard_path}")
-    except Exception as e:
-        logger.error(f"Error building dashboard HTML: {e}", exc_info=True)
-
-    try:
-        docx_path = build_docx_guide(cfg, outdir)
-        logger.info(f"DOCX guide built: {docx_path}")
-    except Exception as e:
-        logger.error(f"Error building DOCX guide: {e}", exc_info=True)
-
-    logger.info("DAIS pipeline complete.")
-
+        for future in tqdm(as_completed(futures), total=len(futures), desc="Processing Assets"):
+            summary.append(future.result())
+            
+    logger.info("Intraday processing batch finished. Assembling documentation suites...")
+    
+    # Exception-isolated documentation generator loops
+    for builder_func, name in [
+        (lambda: build_pdf_report(summary, cfg, outdir), "PDF Report Summary"),
+        (lambda: build_presentation(summary, cfg, outdir), "PPTX Slide Deck"),
+        (lambda: build_dashboard_html(summary, cfg, outdir), "HTML Interactive Dashboard"),
+        (lambda: build_docx_guide(cfg, outdir), "DOCX Operational Manual")
+    ]:
+        try:
+            path = builder_func()
+            logger.info(f"Generated {name} at: {path}")
+        except Exception as e:
+            logger.error(f"Failed to generate documentation asset [{name}]: {e}", exc_info=True)
+            
+    logger.info("High-Frequency DAIS pipeline sequence terminated cleanly.")
 
 if __name__ == "__main__":
     main()
